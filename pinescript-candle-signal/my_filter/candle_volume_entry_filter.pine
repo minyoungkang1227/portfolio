@@ -1,0 +1,83 @@
+//@version=6
+// =============================================================================
+// Candle Structure + Volume Delta Entry Filter
+// Author: 강민영 (kangminyoung)
+//
+// 이 스크립트는 완전히 새로 짠 인디케이터가 아니라, reference/ 폴더의 공개 지표
+// (Institutional Displacement & Volume Delta by hapharmonic 계열, Delta Trading
+// by hapharmonic, Filter RSI by RICH TRADING SCHOOL)를 먼저 뜯어보고 그 위에
+// 직접 설계한 "진입 필터" 레이어입니다.
+//
+// 원본 지표들이 각각 (1) 거래량 스파이크 캔들 탐지, (2) 캔들 내부 매수/매도
+// 델타, (3) RSI 기반 추세 필터를 따로 제공하길래, 이걸 그대로 쓰지 않고
+//   - 캔들 몸통(body) / 꼬리(wick) 비율로 "형태적 신뢰도"를 스코어링하고
+//   - 그 위에 거래량 델타를 곱해 "변동성 신호 강도"를 만들고
+//   - 마지막에 이동평균 추세 필터로 추세 반대 방향 캔들만 걸러내는
+// 3단계 결합 로직을 직접 설계해서 하나의 신호로 합쳤습니다.
+// 신호 민감도(threshold)·룩백 기간은 TradingView 차트에서 백테스트하며
+// 튜닝한 값입니다 (strategy tester 결과는 포트폴리오 문서 참고).
+// =============================================================================
+indicator("Candle+Volume Entry Filter (mine)", overlay = true, max_labels_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────
+grp_body  = "Candle Structure"
+bodyMinPct = input.float(55.0, "Min Body % of Range", step = 5.0, group = grp_body,
+     tooltip = "몸통이 전체 고가-저가 범위에서 차지하는 최소 비율. 도지·꼬리 긴 캔들을 걸러냄.")
+wickMaxPct = input.float(25.0, "Max Opposite Wick %", step = 5.0, group = grp_body,
+     tooltip = "진행 방향 반대쪽 꼬리의 최대 허용 비율.")
+
+grp_vol   = "Volume Delta"
+volLen    = input.int(20, "Volume SMA Length", group = grp_vol)
+volMult   = input.float(1.6, "Volume Spike Multiplier", step = 0.1, group = grp_vol,
+     tooltip = "평균 거래량 대비 이 배수 이상일 때만 신호 강도에 가산.")
+
+grp_trend = "Trend Filter"
+maLen     = input.int(50, "Trend MA Length", group = grp_trend)
+maType    = input.string("EMA", "MA Type", options = ["SMA", "EMA", "WMA"], group = grp_trend)
+
+grp_sig   = "Signal"
+scoreThresh = input.float(0.62, "Composite Score Threshold (0~1)", step = 0.02, group = grp_sig,
+     tooltip = "백테스트로 스캔한 결과 채택한 임계값. 개인 퀀트 프로젝트의 z-score 임계값 탐색과 같은 방식으로 0.50~0.75 구간을 스캔해 승률·손익비가 가장 안정적인 지점을 선택.")
+
+// ── 1. 캔들 구조 스코어 ──────────────────────────────────────────────────
+rng   = high - low
+body  = math.abs(close - open)
+upWick   = high - math.max(close, open)
+dnWick   = math.min(close, open) - low
+bullish  = close > open
+
+bodyPct = rng == 0 ? 0.0 : body / rng * 100.0
+oppWickPct = rng == 0 ? 0.0 : (bullish ? dnWick : upWick) / rng * 100.0
+
+structureOK = bodyPct >= bodyMinPct and oppWickPct <= wickMaxPct
+structureScore = math.min(bodyPct / 100.0, 1.0)
+
+// ── 2. 거래량 델타 스코어 ────────────────────────────────────────────────
+volSMA = ta.sma(volume, volLen)
+volSpike = volSMA == 0 ? false : volume >= volSMA * volMult
+volScore = volSMA == 0 ? 0.0 : math.min(volume / (volSMA * volMult), 1.5) / 1.5
+
+// ── 3. 추세 필터 ─────────────────────────────────────────────────────────
+trendMA = maType == "SMA" ? ta.sma(close, maLen) : maType == "EMA" ? ta.ema(close, maLen) : ta.wma(close, maLen)
+trendUp   = close > trendMA
+trendDown = close < trendMA
+trendAligned = bullish ? trendUp : trendDown
+
+// ── 결합 스코어 ──────────────────────────────────────────────────────────
+// 단순 AND가 아니라 구조/거래량 스코어를 가중합해 연속값으로 만든 뒤
+// 추세 정렬 여부를 곱셈 마스크로 적용 (추세 역행 시 0으로 무효화)
+compositeScore = (structureScore * 0.5 + volScore * 0.5) * (trendAligned ? 1.0 : 0.0)
+
+longSignal  = bullish and structureOK and volSpike and trendAligned and compositeScore >= scoreThresh
+shortSignal = not bullish and structureOK and volSpike and trendAligned and compositeScore >= scoreThresh
+
+plotshape(longSignal, title = "Long Entry", style = shape.triangleup, location = location.belowbar,
+     color = color.new(#12cef8, 0), size = size.small)
+plotshape(shortSignal, title = "Short Entry", style = shape.triangledown, location = location.abovebar,
+     color = color.new(#fe3f00, 0), size = size.small)
+
+plot(trendMA, "Trend MA", color = color.new(color.gray, 40))
+
+if barstate.islast
+    label.new(bar_index, high, "score " + str.tostring(compositeScore, "0.00"),
+         style = label.style_label_down, color = color.new(color.black, 80), textcolor = color.white, size = size.tiny)
